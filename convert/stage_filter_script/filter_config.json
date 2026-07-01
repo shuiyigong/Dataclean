@@ -1,0 +1,36 @@
+{
+  "action_key": "action",
+  "state_key": null,
+  "confidence_key": "observation.confidence",
+  "action_frame": "episode_first_camera",
+  "confidence_min": 0.15,
+  "max_bad_frame_ratio": 0.2,
+  "stage1": {
+    "enabled": true,
+    "smooth_window": 11,
+    "median_window": 5,
+    "residual_mean_multiplier": 10.0,
+    "min_threshold": 1e-6
+  },
+  "stage2": {
+    "enabled": false,
+    "max_lag": 10,
+    "min_directional_agreement": 0.6,
+    "state_dims": null,
+    "action_dims": null
+  },
+  "stage3": {
+    "enabled": true,
+    "lower_percentile": 1.0,
+    "upper_percentile": 99.0,
+    "alpha": 0.2,
+    "exempt_dims": [
+      9,
+      19
+    ]
+  },
+  "stage5": {
+    "enabled": true,
+    "require_fixed_action_frame": true
+  }
+}
