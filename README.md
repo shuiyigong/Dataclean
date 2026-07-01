@@ -24,9 +24,9 @@ python /mnt/project_rlinf/runze/ml-egodex/convert/build_egodex_prefilter_step1.p
 #把人手映射成夹爪，存成npz文件
 
 python convert/visualize_script/visualize_gripper_axes_egoverse.py
-#可视化夹爪坐标系，附带arkit confidence
+#可视化夹爪坐标系
 
-python convert/egodex_npz_to_lerobot_v21_step2.py
+python convert/egoverse_npz_to_lerobot_v21_step2.py
 #把npz文件转成lerobotv2.1格式
 ```
 

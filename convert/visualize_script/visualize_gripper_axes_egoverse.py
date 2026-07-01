@@ -7,10 +7,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-DEFAULT_NPZ = Path("/mnt/project_rlinf/runze/ml-egodex/convert/output/egoverse_demo_npz/2025-10-13-16-23-05-802000.npz")
+DEFAULT_NPZ = Path("/mnt/project_rlinf/runze/ml-egodex/convert/output/egoverse_demo_npz/6970d5bd2d7774fa62bac42b.npz")
 DEFAULT_MANIFEST = None
-DEFAULT_OUTPUT = Path("/mnt/project_rlinf/runze/ml-egodex/convert/output/visualize/egoverse/2025-10-13-16-23-05-802000.mp4")
-SOURCE_MP4 = Path("/mnt/project_rlinf/runze/ml-egodex/convert/output/egoverse_demo_npz/2025-10-13-16-23-05-802000.mp4")
+DEFAULT_OUTPUT = Path("/mnt/project_rlinf/runze/ml-egodex/convert/output/visualize/egoverse/6970d5bd2d7774fa62bac42b.mp4")
+SOURCE_MP4 = Path("/mnt/project_rlinf/runze/ml-egodex/convert/output/egoverse_demo_npz/6970d5bd2d7774fa62bac42b.mp4")
 AXIS_COLORS = {
     "x": (255, 40, 40),   # RGB red
     "y": (40, 220, 40),   # RGB green

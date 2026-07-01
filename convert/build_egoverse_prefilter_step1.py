@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -29,10 +30,7 @@ except ImportError:
 DEFAULT_INPUT = Path("/mnt/project_rlinf/runze/egoverse_demo")
 DEFAULT_OUTPUT = Path("/mnt/project_rlinf/runze/ml-egodex/convert/output/egoverse_demo_npz")
 IMAGE_KEY = "images.front_1"
-DEFAULT_ARIA_INTRINSICS = np.array(
-    [736.6339, 736.6339, 960.0, 540.0, 1920.0, 1080.0, np.nan, np.nan, np.nan, np.nan],
-    dtype=np.float32,
-)
+HASH_TAR_RE = re.compile(r"^[0-9a-fA-F]{24}\.tar$")
 
 HAND_JOINT_ORDER = [
     "wrist",
@@ -69,17 +67,6 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"{type(value).__name__} is not JSON serializable")
 
 
-def _parse_intrinsics_arg(text: str) -> np.ndarray:
-    values = np.fromstring(text.replace(",", " "), sep=" ", dtype=np.float32)
-    if values.size == 4:
-        out = np.full(10, np.nan, dtype=np.float32)
-        out[:4] = values
-        return out
-    if values.size == 10:
-        return values.astype(np.float32)
-    raise argparse.ArgumentTypeError("--fallback-intrinsics expects 4 or 10 numbers")
-
-
 def _episode_id(path: Path) -> str:
     stem = path.stem if path.suffix == ".tar" else path.name
     return f"episode_{int(stem):06d}" if stem.isdigit() else stem
@@ -109,8 +96,12 @@ def _safe_extract_tar(tar_path: Path, target: Path) -> Path:
 
 
 def _iter_episode_roots(input_dir: Path) -> list[Path]:
-    tar_paths = sorted(input_dir.glob("*.tar"))
-    roots = sorted(path for path in input_dir.iterdir() if path.is_dir() and (path / "zarr.json").is_file())
+    tar_paths = sorted(path for path in input_dir.glob("*.tar") if HASH_TAR_RE.fullmatch(path.name))
+    roots = sorted(
+        path
+        for path in input_dir.iterdir()
+        if path.is_dir() and HASH_TAR_RE.fullmatch(f"{path.name}.tar") and (path / "zarr.json").is_file()
+    )
     tar_stems = {path.stem for path in tar_paths}
     roots = [path for path in roots if path.name not in tar_stems]
     return tar_paths + roots
@@ -270,8 +261,6 @@ def _read_attrs(group: Any) -> dict[str, Any]:
 
 
 def _intrinsics_to_vector(intr: Any) -> np.ndarray:
-    if intr is None:
-        return np.full(10, np.nan, dtype=np.float32)
     if isinstance(intr, str):
         try:
             intr = json.loads(intr)
@@ -279,22 +268,16 @@ def _intrinsics_to_vector(intr: Any) -> np.ndarray:
             values = np.fromstring(intr.replace(",", " "), sep=" ", dtype=np.float32)
             return _intrinsics_to_vector(values)
     if isinstance(intr, dict):
-        if "camera_intrinsics" in intr:
-            nested = _intrinsics_to_vector(intr["camera_intrinsics"])
-            if np.isfinite(nested[:4]).all():
-                return nested
-        if "intrinsics" in intr:
-            nested = _intrinsics_to_vector(intr["intrinsics"])
-            if np.isfinite(nested[:4]).all():
-                return nested
+        if not intr:
+            raise ValueError("attrs['intrinsics'] is empty")
         return np.array(
             [
-                intr.get("fl_x", intr.get("fx", intr.get("focal_length_x", np.nan))),
-                intr.get("fl_y", intr.get("fy", intr.get("focal_length_y", np.nan))),
-                intr.get("cx", intr.get("principal_point_x", np.nan)),
-                intr.get("cy", intr.get("principal_point_y", np.nan)),
-                intr.get("w", intr.get("width", np.nan)),
-                intr.get("h", intr.get("height", np.nan)),
+                intr["fl_x"],
+                intr["fl_y"],
+                intr["cx"],
+                intr["cy"],
+                intr["w"],
+                intr["h"],
                 intr.get("k1", np.nan),
                 intr.get("k2", np.nan),
                 intr.get("p1", np.nan),
@@ -305,88 +288,16 @@ def _intrinsics_to_vector(intr: Any) -> np.ndarray:
     arr = np.asarray(intr, dtype=np.float32).reshape(-1)
     if arr.size == 10:
         return arr.astype(np.float32)
-    if arr.size == 9:
-        mat = arr.reshape(3, 3)
-        return np.array(
-            [mat[0, 0], mat[1, 1], mat[0, 2], mat[1, 2], np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-            dtype=np.float32,
-        )
-    if arr.size >= 4:
-        out = np.full(10, np.nan, dtype=np.float32)
-        out[: min(arr.size, 10)] = arr[:10]
-        return out
-    return np.full(10, np.nan, dtype=np.float32)
+    raise ValueError(f"Expected EgoVerse intrinsics dict or 10-vector, got shape {arr.shape}")
 
 
-def _feature_image_size(attrs: dict[str, Any], group: Any) -> tuple[float, float] | None:
-    features = attrs.get("features")
-    if isinstance(features, dict):
-        image_feature = features.get(IMAGE_KEY)
-        if isinstance(image_feature, dict):
-            shape = image_feature.get("shape")
-            if isinstance(shape, (list, tuple)) and len(shape) >= 2:
-                return float(shape[1]), float(shape[0])
-    if IMAGE_KEY in group:
-        images = group[IMAGE_KEY]
-        feature_shape = getattr(images, "shape", ())
-        if len(feature_shape) >= 3:
-            return float(feature_shape[-2]), float(feature_shape[-3])
-    return None
-
-
-def _scale_intrinsics_to_image(intrinsics: np.ndarray, image_size: tuple[float, float]) -> np.ndarray:
-    width, height = image_size
-    out = intrinsics.astype(np.float32).copy()
-    source_w, source_h = out[4], out[5]
-    if not np.isfinite(source_w) or source_w <= 0:
-        source_w = out[2] * 2.0
-    if not np.isfinite(source_h) or source_h <= 0:
-        source_h = out[3] * 2.0
-    if np.isfinite(source_w) and source_w > 0 and np.isfinite(source_h) and source_h > 0:
-        sx = float(width) / float(source_w)
-        sy = float(height) / float(source_h)
-        out[0] *= sx
-        out[2] *= sx
-        out[1] *= sy
-        out[3] *= sy
-        out[4] = width
-        out[5] = height
-    return out
-
-
-def _camera_intrinsics_from_episode(
-    attrs: dict[str, Any],
-    group: Any,
-    fallback_intrinsics: np.ndarray,
-) -> tuple[np.ndarray, str]:
-    candidates = [
-        ("root_attrs.intrinsics", attrs.get("intrinsics")),
-        ("root_attrs.camera_intrinsics", attrs.get("camera_intrinsics")),
-    ]
-    for key in [IMAGE_KEY, "camera", "front_1"]:
-        if key in group:
-            obj_attrs = dict(getattr(group[key], "attrs", {}))
-            candidates.extend(
-                [
-                    (f"{key}.attrs.intrinsics", obj_attrs.get("intrinsics")),
-                    (f"{key}.attrs.camera_intrinsics", obj_attrs.get("camera_intrinsics")),
-                ]
-            )
-
-    image_size = _feature_image_size(attrs, group)
-    for source, raw in candidates:
-        intrinsics = _intrinsics_to_vector(raw)
-        if np.isfinite(intrinsics[:4]).all():
-            if image_size is not None and (not np.isfinite(intrinsics[4:6]).all() or tuple(intrinsics[4:6]) != image_size):
-                intrinsics = _scale_intrinsics_to_image(intrinsics, image_size)
-                source = f"{source}, scaled_to_{int(image_size[0])}x{int(image_size[1])}"
-            return intrinsics.astype(np.float32), source
-
-    if image_size is not None:
-        return _scale_intrinsics_to_image(fallback_intrinsics, image_size), (
-            f"fallback_aria_intrinsics_scaled_to_{int(image_size[0])}x{int(image_size[1])}"
-        )
-    return fallback_intrinsics.astype(np.float32), "fallback_aria_intrinsics_unscaled"
+def _camera_intrinsics_from_episode(attrs: dict[str, Any]) -> np.ndarray:
+    if "intrinsics" not in attrs:
+        raise KeyError("Expected hash-named EgoVerse episode metadata to contain attrs['intrinsics']")
+    intrinsics = _intrinsics_to_vector(attrs["intrinsics"]).astype(np.float32)
+    if not np.isfinite(intrinsics[:6]).all():
+        raise ValueError(f"Invalid attrs['intrinsics']: {attrs['intrinsics']!r}")
+    return intrinsics
 
 
 def _read_annotations(group: Any) -> list[dict[str, Any]]:
@@ -413,6 +324,7 @@ def process_episode(path: Path, args: argparse.Namespace) -> tuple[dict[str, Any
     with tempfile.TemporaryDirectory(prefix="egoverse_demo_step1_") as tmp_s:
         group, root = _open_episode(path, Path(tmp_s))
         attrs = _read_attrs(group)
+        camera_intrinsics = _camera_intrinsics_from_episode(attrs)
         required = [
             "left.obs_keypoints",
             "right.obs_keypoints",
@@ -425,10 +337,16 @@ def process_episode(path: Path, args: argparse.Namespace) -> tuple[dict[str, Any
         left_world = np.asarray(group["left.obs_keypoints"][:], dtype=np.float32).reshape(-1, 21, 3)
         right_world = np.asarray(group["right.obs_keypoints"][:], dtype=np.float32).reshape(-1, 21, 3)
         head_pose_world = np.asarray(group["obs_head_pose"][:], dtype=np.float64)
-        n = min(left_world.shape[0], right_world.shape[0], head_pose_world.shape[0])
-        left_world = left_world[:n]
-        right_world = right_world[:n]
-        head_pose_world = head_pose_world[:n]
+        lengths = {
+            "left.obs_keypoints": left_world.shape[0],
+            "right.obs_keypoints": right_world.shape[0],
+            "obs_head_pose": head_pose_world.shape[0],
+        }
+        if len(set(lengths.values())) != 1:
+            raise ValueError(f"{path} has mismatched required array lengths: {lengths}")
+        n = left_world.shape[0]
+        if n == 0:
+            raise ValueError(f"{path} has no frames")
 
         left = _to_first_camera_frame(left_world, head_pose_world)
         right = _to_first_camera_frame(right_world, head_pose_world)
@@ -460,17 +378,21 @@ def process_episode(path: Path, args: argparse.Namespace) -> tuple[dict[str, Any
         right_valid = _valid_keypoint_rows(right_world)
         head_valid = _valid_pose_rows(head_pose_world)
         keep_mask = np.logical_and.reduce([left_valid, right_valid, head_valid, *valid_masks])
+        if not bool(keep_mask.all()):
+            invalid = {
+                "left_keypoints": int((~left_valid).sum()),
+                "right_keypoints": int((~right_valid).sum()),
+                "camera_pose": int((~head_valid).sum()),
+                "left_gripper": int((~valid_masks[0]).sum()),
+                "right_gripper": int((~valid_masks[1]).sum()),
+                "combined": int((~keep_mask).sum()),
+            }
+            raise ValueError(f"{path} has invalid/missing frames: {invalid}")
         action_raw = np.concatenate(raw_action_parts, axis=-1).astype(np.float32)
         action = np.concatenate(action_parts, axis=-1).astype(np.float32)
         fps = int(attrs.get("fps") or args.fps)
         timestamps = np.arange(n, dtype=np.float32) / float(fps)
         video_path = _write_mp4(group, args.output_dir / f"{_episode_id(path)}.mp4", fps)
-
-        camera_intrinsics, camera_intrinsics_source = _camera_intrinsics_from_episode(
-            attrs,
-            group,
-            args.fallback_intrinsics,
-        )
 
         camera_extrinsics_world = np.stack([_pose7_to_matrix(p).astype(np.float32) for p in head_pose_world], axis=0)
         arrays = {
@@ -502,7 +424,7 @@ def process_episode(path: Path, args: argparse.Namespace) -> tuple[dict[str, Any
             "joint_frame": "episode_first_camera",
             "source_joint_frame": "EgoVerse episode/world coordinates",
             "camera_frame_reference": "obs_head_pose[0]",
-            "camera_intrinsics_source": camera_intrinsics_source,
+            "camera_intrinsics_source": "root_attrs.intrinsics",
             "camera_intrinsics_layout": "fx, fy, cx, cy, width, height, k1, k2, p1, p2",
             "action_layout": {
                 "per_hand": "position(3), rotation_6d(6), width(1)",
@@ -537,8 +459,16 @@ def build_dataset(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"No EgoVerse .tar or extracted zarr episodes found under {input_dir}")
 
     summaries = []
+    skipped = []
     for path in episode_paths:
-        summary, arrays = process_episode(path, args)
+        try:
+            summary, arrays = process_episode(path, args)
+        except Exception as exc:
+            if not args.skip_invalid:
+                raise
+            skipped.append({"source_path": str(path), "reason": f"{type(exc).__name__}: {exc}"})
+            print(f"skipped {path}: {type(exc).__name__}: {exc}")
+            continue
         out_path = output_dir / f"{_episode_id(path)}.npz"
         np.savez_compressed(out_path, **arrays)
         summary["npz_path"] = str(out_path)
@@ -552,6 +482,7 @@ def build_dataset(args: argparse.Namespace) -> None:
         "input_dir": str(input_dir),
         "output_dir": str(output_dir),
         "num_episodes": len(summaries),
+        "num_skipped": len(skipped),
         "total_frames": int(sum(item["num_frames"] for item in summaries)),
         "keypoint_order": HAND_JOINT_ORDER,
         "coordinate_note": (
@@ -573,6 +504,7 @@ def build_dataset(args: argparse.Namespace) -> None:
             "rot_sigma": args.rot_sigma,
         },
         "episodes": summaries,
+        "skipped_episodes": skipped,
     }
     manifest_path = output_dir / "manifest.json"
     with manifest_path.open("w", encoding="utf-8") as f:
@@ -584,21 +516,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build EgoVerse demo pre-filter action-alignment outputs.")
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--position-window", type=int, default=11)
     parser.add_argument("--width-window", type=int, default=11)
     parser.add_argument("--polyorder", type=int, default=2)
     parser.add_argument("--rot-sigma", type=float, default=2.0)
     parser.add_argument(
-        "--fallback-intrinsics",
-        type=_parse_intrinsics_arg,
-        default=DEFAULT_ARIA_INTRINSICS,
-        help=(
-            "Fallback camera intrinsics as 4 numbers (fx fy cx cy) or 10 numbers "
-            "(fx fy cx cy width height k1 k2 p1 p2). Used when EgoVerse tar metadata "
-            "does not contain intrinsics; scaled to the image size recorded in zarr metadata."
-        ),
+        "--skip-invalid",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip hash-named episodes that are missing required arrays or intrinsics.",
     )
     return parser.parse_args()
 
