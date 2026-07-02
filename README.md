@@ -40,4 +40,7 @@ observation.camera_intrinsics
 observation.images.camera_top  
 ```
 
-# Qwen Data Pipeline (Stage1 - Stage 3)
+# Qwen Data Pipeline
+```
+见/mnt/project_rlinf/runze/ml-egodex/qwen-manip-preprocess
+```
