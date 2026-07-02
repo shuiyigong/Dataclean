@@ -1,0 +1,106 @@
+schema:
+  embodiment: humanoid
+  layout: joint_gripper
+  canonical_dim: 14
+
+dataset:
+  root: /mnt/project_rlinf_hs/dreamzero_pretrain_data/humanoid_merged
+  embodiment: humanoid
+  robot_type: agilex_cobotmagic2
+  fps: 30
+  total_episodes: 46475
+
+pipeline:
+  num_workers: 128
+  output_mode: both  # report | filter | both
+  min_episode_length: 30
+  action_zero_epsilon: 1.0e-4
+  stage1_post_zero_grace_frames: 60
+  discard_short_prefix: false
+
+preprocess:
+  action_from_state: true  # discard original action; set action = state (arm+gripper)
+
+stage1:
+  stats:
+    recompute: true
+    cache_path: cache/stage1_global_stats.npz
+  smoothing:
+    median_kernel: 5
+    savgol_window: 11
+    savgol_polyorder: 3
+  thresholds:
+    k_residual: 60.0
+    k_accel: 60.0
+    k_jerk: 60.0
+    percentile_floor: 99.999
+  hard_limits:
+    joint_abs_max: 3.5
+    ee_position_max: 2.0
+    rpy_abs_max: 3.14159265
+    gripper_max: 1.0
+  exclusion:
+    mode: validity_mask
+    frame_removal:
+      max_cluster_length: 4
+      min_cluster_length_for_abnormal: 1
+    episode_discard:
+      min_cluster_length: 50
+      min_cluster_frame_jump: 0.25
+      on_hard_limit_violation: true
+
+stage2:
+  action_type: absolute
+  shared_dims:
+    state_key: observation.state
+    action_key: action
+    num_dims: 14
+  smoothing:
+    median_kernel: 5
+    savgol_window: 11
+    savgol_polyorder: 3
+  alignment:
+    max_lag_frames: 5
+    diff_epsilon: 1.0e-4
+    min_active_samples: 10
+  thresholds:
+    da_per_dim: 0.65
+    da_episode_mean: 0.65
+  exclusion:
+    mode: episode_discard
+
+stage3:
+  stats:
+    recompute: true
+    cache_path: cache/global_stats.npz
+    num_histogram_bins: 65536
+  alpha: 0.35
+  exempt_dims:
+    gripper_state: [12, 13]
+    gripper_action: [12, 13]
+    rpy_state: []
+    rpy_action: []
+  hard_limits:
+    joint: [-3.5, 3.5]
+    ee_xyz: [-2.0, 2.0]
+    rpy: [-3.15, 3.15]
+    gripper: [-0.01, 1.0]
+  quaternion:
+    norm_min: 0.95
+    norm_max: 1.05
+    component_abs_max: 1.01
+  exclusion:
+    mode: frame_removal
+    min_episode_length: 30
+    validity_mask: prefix_truncate
+
+stage4:
+  enabled: true
+  max_static_steps: 5  # keep at most 5 frames per static run; remove the rest
+  change_epsilon: 0.0
+
+stage5:
+  enabled: true
+  reference_frame: camera_top_frame0
+  rotation_correction_euler_xyz: [0.0, -1.5707963267948966, 0.0]
+  humanoid_camera_extrinsic_key: camera_front_to_arm_left

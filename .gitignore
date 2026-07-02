@@ -1,4 +1,21 @@
-convert/output/
+# Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
 
+# IDE / env
+.venv/
+venv/
+.env
+
+# Pipeline / convert outputs
+convert/output/
+qwen-manip-preprocess/output/
+
+# Local caches & logs
+*.log
+.DS_Store
