@@ -42,5 +42,5 @@ observation.images.camera_top
 
 # Qwen Data Pipeline
 ```
-见/mnt/project_rlinf/runze/ml-egodex/qwen-manip-preprocess
+见qwen-manip-preprocess
 ```
