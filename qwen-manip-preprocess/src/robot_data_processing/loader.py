@@ -15,8 +15,10 @@ from robot_data_processing.schema import (
 )
 from robot_data_processing.transforms import (
     egodex_to_canonical,
-    humanoid_action_to_canonical,
-    humanoid_state_to_canonical,
+    humanoid_action_arrays,
+    humanoid_state_arrays,
+    robomind_ur_build_action,
+    robomind_ur_build_state,
 )
 
 
@@ -50,9 +52,11 @@ def _transform_to_canonical(
         return state, action
     if schema.embodiment == "humanoid":
         return (
-            humanoid_state_to_canonical(raw[schema.state_column]),
-            humanoid_action_to_canonical(raw[schema.action_column]),
+            humanoid_state_arrays(raw[schema.state_column]),
+            humanoid_action_arrays(raw[schema.action_column]),
         )
+    if schema.embodiment == "robomind_ur":
+        return robomind_ur_build_state(raw), robomind_ur_build_action(raw)
     raise ValueError(f"Unsupported embodiment: {schema.embodiment}")
 
 
@@ -61,7 +65,7 @@ def read_episode_canonical(
     schema: DatasetSchema = HUMANOID_SCHEMA,
     action_from_state: bool = False,
 ) -> dict[str, np.ndarray]:
-    """Read parquet and return canonical state/action (T, 14) arrays."""
+    """Read parquet and return pipeline state/action arrays."""
     table = pq.read_table(path, columns=list(schema.raw_columns))
     raw: dict[str, np.ndarray] = {}
     for name in schema.raw_columns:

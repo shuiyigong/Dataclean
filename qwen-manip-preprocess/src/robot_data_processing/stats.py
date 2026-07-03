@@ -105,8 +105,8 @@ def compute_global_stats(
     action_from_state: bool = False,
 ) -> GlobalStats:
     """Two-pass parallel histogram stats over canonical state/action."""
-    state_dim = schema.canonical_dim
-    action_dim = schema.canonical_dim
+    state_dim = schema.pipeline_state_dim
+    action_dim = schema.pipeline_action_dim
     args_list = [
         (str(dataset_root), idx, num_bins, action_from_state, schema) for idx in episode_indices
     ]
@@ -191,7 +191,7 @@ def load_or_compute_stats(
 ) -> GlobalStats:
     if cache_path.exists() and not recompute:
         loaded = GlobalStats.load(str(cache_path))
-        if loaded.state_q01.shape[0] == schema.canonical_dim:
+        if loaded.state_q01.shape[0] == schema.pipeline_state_dim:
             return loaded
 
     stats = compute_global_stats(

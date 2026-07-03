@@ -50,12 +50,25 @@ def _hard_limit_abnormal_frames(
     reasons: list[str] = []
 
     if schema.layout == "joint_gripper":
-        abnormal |= np.any(np.abs(state[:, :12]) > cfg.joint_abs_max, axis=1)
-        abnormal |= np.any(np.abs(action[:, :12]) > cfg.joint_abs_max, axis=1)
-        if np.any(np.abs(state[:, :12]) > cfg.joint_abs_max):
-            reasons.append("hard_limit_state_joint")
-        if np.any(np.abs(action[:, :12]) > cfg.joint_abs_max):
-            reasons.append("hard_limit_action_joint")
+        joints = list(schema.joint_indices)
+        action_joints = list(schema.action_joint_indices)
+        if joints:
+            abnormal |= np.any(np.abs(state[:, joints]) > cfg.joint_abs_max, axis=1)
+            if np.any(np.abs(state[:, joints]) > cfg.joint_abs_max):
+                reasons.append("hard_limit_state_joint")
+        if action_joints:
+            abnormal |= np.any(np.abs(action[:, action_joints]) > cfg.joint_abs_max, axis=1)
+            if np.any(np.abs(action[:, action_joints]) > cfg.joint_abs_max):
+                reasons.append("hard_limit_action_joint")
+        if state.shape[1] > 14 and schema.embodiment == "humanoid":
+            ee_xyz_idx = (14, 15, 16, 21, 22, 23)
+            abnormal |= np.any(np.abs(state[:, ee_xyz_idx]) > cfg.ee_position_max, axis=1)
+            if np.any(np.abs(state[:, ee_xyz_idx]) > cfg.ee_position_max):
+                reasons.append("hard_limit_state_ee_xyz")
+            quat_idx = list(range(17, 21)) + list(range(24, 28))
+            abnormal |= np.any(np.abs(state[:, quat_idx]) > 1.01, axis=1)
+            if np.any(np.abs(state[:, quat_idx]) > 1.01):
+                reasons.append("hard_limit_state_ee_quat")
     else:
         xyz = list(schema.xyz_indices)
         if xyz:
@@ -70,10 +83,11 @@ def _hard_limit_abnormal_frames(
 
     for gi in schema.gripper_indices:
         abnormal |= np.abs(state[:, gi]) > cfg.gripper_max
+    for gi in schema.action_gripper_indices:
         abnormal |= np.abs(action[:, gi]) > cfg.gripper_max
     if any(np.any(np.abs(state[:, gi]) > cfg.gripper_max) for gi in schema.gripper_indices):
         reasons.append("hard_limit_state_gripper")
-    if any(np.any(np.abs(action[:, gi]) > cfg.gripper_max) for gi in schema.gripper_indices):
+    if any(np.any(np.abs(action[:, gi]) > cfg.gripper_max) for gi in schema.action_gripper_indices):
         reasons.append("hard_limit_action_gripper")
 
     return abnormal, bool(reasons), reasons
