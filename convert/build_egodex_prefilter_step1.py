@@ -48,6 +48,23 @@ def _rotation_checks(rotation: np.ndarray) -> dict[str, float]:
     }
 
 
+def _valid_keypoint_rows(keypoints: np.ndarray) -> np.ndarray:
+    flat = np.asarray(keypoints).reshape(keypoints.shape[0], -1)
+    valid = np.isfinite(flat).all(axis=1)
+    valid &= np.abs(flat).sum(axis=1) > 1e-9
+    valid &= (np.abs(flat) < 1e8).all(axis=1)
+    return valid
+
+
+def _valid_pose_rows(T: np.ndarray) -> np.ndarray:
+    flat = np.asarray(T).reshape(T.shape[0], -1)
+    valid = np.isfinite(flat).all(axis=1)
+    R = T[:, :3, :3]
+    det = np.linalg.det(R)
+    valid &= np.abs(det - 1.0) < 1e-2
+    return valid
+
+
 def _to_first_camera_frame(
     joints_world: dict[str, np.ndarray],
     camera_extrinsics_world: np.ndarray,
@@ -71,8 +88,11 @@ def process_episode(hdf5_path: Path, args: argparse.Namespace) -> tuple[dict[str
     action_parts = []
     raw_action_parts = []
     valid_masks = []
+    keypoint_valid_masks = {}
     checks = {}
     for hand in ["left", "right"]:
+        hand_keypoints = np.stack([keypoints[hand][k] for k in ["thumb", "index", "middle", "wrist"]], axis=1)
+        keypoint_valid_masks[hand] = _valid_keypoint_rows(hand_keypoints)
         gripper = retarget_to_gripper(keypoints[hand], hand)
         gripper_smooth = smooth_gripper(
             gripper,
@@ -91,7 +111,8 @@ def process_episode(hdf5_path: Path, args: argparse.Namespace) -> tuple[dict[str
 
     action_raw = np.concatenate(raw_action_parts, axis=-1).astype(np.float32)
     action = np.concatenate(action_parts, axis=-1).astype(np.float32)
-    keep_mask = np.logical_and.reduce(valid_masks)
+    camera_pose_valid = _valid_pose_rows(meta["camera_extrinsics_world"])
+    keep_mask = np.logical_and.reduce([camera_pose_valid, *keypoint_valid_masks.values(), *valid_masks])
     timestamps = np.arange(meta["num_frames"], dtype=np.float32) / float(meta["fps"])
 
     conf_arrays = {}
@@ -109,6 +130,9 @@ def process_episode(hdf5_path: Path, args: argparse.Namespace) -> tuple[dict[str
         "action_raw": action_raw,
         "action_smooth": action,
         "keep_mask_pre_filter": keep_mask,
+        "left_keypoints_valid": keypoint_valid_masks["left"],
+        "right_keypoints_valid": keypoint_valid_masks["right"],
+        "camera_pose_valid": camera_pose_valid,
         "camera_extrinsics_world": meta["camera_extrinsics_world"],
         "camera_intrinsics": meta["camera_intrinsics"],
         "left_keypoints": np.stack([keypoints["left"][k] for k in ["thumb", "index", "middle", "wrist"]], axis=1),
@@ -140,6 +164,12 @@ def process_episode(hdf5_path: Path, args: argparse.Namespace) -> tuple[dict[str
             "shape": list(action.shape),
         },
         "valid_frames_pre_filter": int(keep_mask.sum()),
+        "validity": {
+            "left_keypoints": int(keypoint_valid_masks["left"].sum()),
+            "right_keypoints": int(keypoint_valid_masks["right"].sum()),
+            "camera_pose": int(camera_pose_valid.sum()),
+            "combined": int(keep_mask.sum()),
+        },
         "rotation_checks": checks,
     }
     return summary, arrays
