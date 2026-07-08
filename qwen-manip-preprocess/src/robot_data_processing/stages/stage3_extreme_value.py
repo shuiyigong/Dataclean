@@ -41,8 +41,18 @@ def _check_hard_limits(
 
     if schema.layout == "joint_gripper":
         j_lo, j_hi = cfg.joint_limits
-        bad |= np.any((state[:, :12] < j_lo) | (state[:, :12] > j_hi), axis=1)
-        bad |= np.any((action[:, :12] < j_lo) | (action[:, :12] > j_hi), axis=1)
+        joints = list(schema.joint_indices)
+        action_joints = list(schema.action_joint_indices)
+        if joints:
+            bad |= np.any((state[:, joints] < j_lo) | (state[:, joints] > j_hi), axis=1)
+        if action_joints:
+            bad |= np.any((action[:, action_joints] < j_lo) | (action[:, action_joints] > j_hi), axis=1)
+        if state.shape[1] > 14 and schema.embodiment == "humanoid":
+            e_lo, e_hi = cfg.ee_xyz_limits
+            ee_xyz_idx = (14, 15, 16, 21, 22, 23)
+            bad |= np.any((state[:, ee_xyz_idx] < e_lo) | (state[:, ee_xyz_idx] > e_hi), axis=1)
+            quat_idx = list(range(17, 21)) + list(range(24, 28))
+            bad |= np.any((state[:, quat_idx] < -1.01) | (state[:, quat_idx] > 1.01), axis=1)
     else:
         xyz = list(schema.xyz_indices)
         if xyz:
@@ -56,7 +66,7 @@ def _check_hard_limits(
     g_lo, g_hi = cfg.gripper_limits
     for gi in schema.gripper_indices:
         bad |= (state[:, gi] < g_lo) | (state[:, gi] > g_hi)
-    for gi in schema.gripper_indices:
+    for gi in schema.action_gripper_indices:
         bad |= (action[:, gi] < g_lo) | (action[:, gi] > g_hi)
 
     return bad
@@ -99,7 +109,7 @@ def run_stage3(
     state_exempt = set(cfg.gripper_state_indices) | set(cfg.rpy_state_indices)
     action_exempt = set(cfg.gripper_action_indices) | set(cfg.rpy_action_indices)
 
-    align_dims = 12 if schema.layout == "joint_gripper" else state.shape[1]
+    align_dims = min(len(schema.action_joint_indices), action.shape[1]) if schema.layout == "joint_gripper" else state.shape[1]
     percentile_bad = _check_percentile_band(
         state,
         stats.state_q01,

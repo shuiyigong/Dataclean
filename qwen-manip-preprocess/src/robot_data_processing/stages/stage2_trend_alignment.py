@@ -26,7 +26,7 @@ class Stage2Result:
     discard: bool
     discard_reasons: list[str]
     da_mean: float | None
-    da_per_dim: list[float]
+    da_per_dim: list[float | None]
     lags: list[int]
 
 
@@ -64,7 +64,10 @@ def _compute_da_and_lag(
         s1 = ds[: n + best_lag]
         s2 = da[-best_lag :]
 
-    active = (np.abs(s1) > cfg.diff_epsilon) & (np.abs(s2) > cfg.diff_epsilon)
+    # Only skip frames where both state and action are still; score when either moves
+    # (handles recordings where state is flat but action changes).
+    both_still = (np.abs(s1) <= cfg.diff_epsilon) & (np.abs(s2) <= cfg.diff_epsilon)
+    active = ~both_still
     if active.sum() < cfg.min_active_samples:
         return None, best_lag
     da_score = float((np.sign(s1[active]) == np.sign(s2[active])).mean())
@@ -79,32 +82,27 @@ def run_stage2(
     if cfg.action_type == "delta":
         action_arm = _integrate_delta(action_arm)
 
-    da_dims: list[float] = []
+    num_dims = min(state_arm.shape[1], action_arm.shape[1])
+    da_per_dim: list[float | None] = []
     lags: list[int] = []
-    for d in range(state_arm.shape[1]):
+    for d in range(num_dims):
         score, lag = _compute_da_and_lag(state_arm[:, d], action_arm[:, d], cfg)
         lags.append(lag)
-        if score is not None:
-            da_dims.append(score)
+        da_per_dim.append(score)
 
+    scored = [v for v in da_per_dim if v is not None]
+    da_mean = float(np.mean(scored)) if scored else None
+
+    low_dims = [d for d, v in enumerate(da_per_dim) if v is not None and v < cfg.da_per_dim]
+    discard = bool(low_dims)
     reasons: list[str] = []
-    discard = False
-    da_mean: float | None = None
-
-    if da_dims:
-        da_mean = float(np.mean(da_dims))
-        if da_mean < cfg.da_episode_mean:
-            discard = True
-            reasons.append(f"da_episode_mean={da_mean:.4f}<{cfg.da_episode_mean}")
-        low_dims = [i for i, v in enumerate(da_dims) if v < cfg.da_per_dim]
-        if low_dims:
-            discard = True
-            reasons.append(f"da_low_dims={low_dims}")
+    if low_dims:
+        reasons.append(f"da_low_dims={low_dims}")
 
     return Stage2Result(
         discard=discard,
         discard_reasons=reasons,
         da_mean=da_mean,
-        da_per_dim=da_dims,
+        da_per_dim=da_per_dim,
         lags=lags,
     )

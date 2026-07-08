@@ -39,17 +39,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-recompute-stats", action="store_true")
     parser.add_argument("--stats-cache", type=Path, default=None)
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument(
-        "--action-from-state",
-        action="store_true",
-        default=None,
-        help="Replace action with state before pipeline (discard original action)",
-    )
-    parser.add_argument(
-        "--no-action-from-state",
-        action="store_true",
-        help="Disable action=state preprocessing even if enabled in config",
-    )
     args = parser.parse_args(argv)
 
     yaml_cfg = load_config(args.config)
@@ -66,10 +55,6 @@ def main(argv: list[str] | None = None) -> int:
         overrides["stats_recompute"] = True
     if args.no_recompute_stats:
         overrides["stats_recompute"] = False
-    if args.action_from_state:
-        overrides["action_from_state"] = True
-    if args.no_action_from_state:
-        overrides["action_from_state"] = False
 
     cfg = pipeline_config_from_yaml(yaml_cfg, overrides)
 
@@ -99,7 +84,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Output dir:   {cfg.output_dir}")
     print(f"Output mode:  {cfg.output_mode}")
     print(f"Workers:      {cfg.num_workers}")
-    print(f"Preprocess:   action_from_state={cfg.action_from_state}")
+    align_cfg = cfg.state_action_alignment
+    if align_cfg and align_cfg.enabled and cfg.schema.embodiment == "humanoid":
+        print(f"Post-align:   state_action_temporal_alignment (humanoid only)")
     print(f"Stats episodes: {len(stats_indices)} ({stats_scope})")
     print(f"Process episodes: {len(process_indices)}")
 

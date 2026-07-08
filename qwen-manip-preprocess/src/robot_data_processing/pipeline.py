@@ -14,14 +14,22 @@ from robot_data_processing.loader import (
     read_episode_table,
     write_episode_with_validity_mask,
 )
-from robot_data_processing.preprocess import replace_action_with_state_table
 from robot_data_processing.mask import (
     build_frame_keep_mask,
     compute_per_joint_action_zero_exclude,
     compute_per_joint_stage1_exclude,
 )
+from robot_data_processing.preprocess import (
+    apply_robomind_temporal_alignment,
+    expand_compact_exclude_to_action,
+    extract_state_action_from_table,
+    update_table_action_columns,
+)
+from robot_data_processing.transforms import robomind_ur_compact_teleop
 from robot_data_processing.report import build_quality_report, write_exclusion_log, write_quality_report
 from robot_data_processing.schema import DatasetSchema, schema_from_yaml
+from robot_data_processing.stage1_stats import Stage1GlobalStats, load_or_compute_stage1_stats
+from robot_data_processing.state_action_lag_stats import load_or_compute_action_state_lag
 from robot_data_processing.stages.stage1_sudden_change import Stage1Config, run_stage1
 from robot_data_processing.stages.stage2_trend_alignment import Stage2Config, run_stage2
 from robot_data_processing.stages.stage3_extreme_value import Stage3Config, run_stage3
@@ -31,7 +39,13 @@ from robot_data_processing.stages.stage5_frame_alignment import (
     read_stage5_raw_context,
     run_stage5,
 )
-from robot_data_processing.stage1_stats import Stage1GlobalStats, load_or_compute_stage1_stats
+from robot_data_processing.stages.state_action_temporal_alignment import (
+    StateActionAlignConfig,
+    alignment_metadata,
+    apply_state_action_temporal_alignment,
+    matched_alignment_dims,
+    resolve_alignment_lag,
+)
 from robot_data_processing.stats import load_or_compute_stats
 from robot_data_processing.types import EpisodeResult, GlobalStats
 
@@ -49,25 +63,34 @@ class PipelineConfig:
     stage3: Stage3Config | None = None
     stage4: Stage4Config | None = None
     stage5: Stage5Config | None = None
+    state_action_alignment: StateActionAlignConfig | None = None
+    alignment_lag: int | None = None
     stats_recompute: bool = True
     stats_cache_path: Path | None = None
     stage1_stats_recompute: bool = True
     stage1_stats_cache_path: Path | None = None
+    state_action_lag_recompute: bool = True
+    state_action_lag_cache_path: Path | None = None
     stats_num_bins: int = 65536
     total_episodes: int | None = None
     action_zero_epsilon: float = 1e-4
     stage1_post_zero_grace_frames: int = 0
     discard_short_prefix: bool = False
-    action_from_state: bool = False
 
 
 _WORKER_STATE: dict[str, Any] = {}
 
 
-def _init_worker(global_stats: GlobalStats, stage1_stats: Stage1GlobalStats, pipe_cfg: PipelineConfig) -> None:
+def _init_worker(
+    global_stats: GlobalStats,
+    stage1_stats: Stage1GlobalStats,
+    pipe_cfg: PipelineConfig,
+    align_stats: Any = None,
+) -> None:
     _WORKER_STATE["stats"] = global_stats
     _WORKER_STATE["stage1_stats"] = stage1_stats
     _WORKER_STATE["cfg"] = pipe_cfg
+    _WORKER_STATE["align_stats"] = align_stats
 
 
 def process_episode(episode_index: int, pipe_cfg: PipelineConfig | None = None) -> EpisodeResult:
@@ -90,7 +113,7 @@ def process_episode(episode_index: int, pipe_cfg: PipelineConfig | None = None) 
             step_validity_mask=np.array([], dtype=np.int8),
         )
 
-    data = read_episode_canonical(path, schema=schema, action_from_state=cfg.action_from_state)
+    data = read_episode_canonical(path, schema=schema)
     state = data["state"]
     action = data["action"]
     num_frames = state.shape[0]
@@ -100,11 +123,23 @@ def process_episode(episode_index: int, pipe_cfg: PipelineConfig | None = None) 
     s3_cfg = cfg.stage3 or Stage3Config()
     s4_cfg = cfg.stage4 or Stage4Config()
     s5_cfg = cfg.stage5 or Stage5Config()
+    align_cfg = cfg.state_action_alignment or StateActionAlignConfig()
 
-    startup_exclude = compute_per_joint_action_zero_exclude(action, cfg.action_zero_epsilon)
-    stage1_exclude = compute_per_joint_stage1_exclude(
-        action, cfg.action_zero_epsilon, cfg.stage1_post_zero_grace_frames
+    action_for_masks = action
+    if schema.embodiment == "robomind_ur":
+        _, action_compact = robomind_ur_compact_teleop(state, action)
+        action_for_masks = action_compact
+
+    startup_exclude_compact = compute_per_joint_action_zero_exclude(action_for_masks, cfg.action_zero_epsilon)
+    stage1_exclude_compact = compute_per_joint_stage1_exclude(
+        action_for_masks, cfg.action_zero_epsilon, cfg.stage1_post_zero_grace_frames
     )
+    if schema.embodiment == "robomind_ur":
+        startup_exclude = expand_compact_exclude_to_action(startup_exclude_compact, action.shape[1])
+        stage1_exclude = expand_compact_exclude_to_action(stage1_exclude_compact, action.shape[1])
+    else:
+        startup_exclude = startup_exclude_compact
+        stage1_exclude = stage1_exclude_compact
 
     s1 = run_stage1(
         state,
@@ -160,6 +195,10 @@ def process_episode(episode_index: int, pipe_cfg: PipelineConfig | None = None) 
             "aligned_state_shape": list(s5.aligned_state.shape),
         }
 
+    align_stats = _WORKER_STATE.get("align_stats")
+    align_lag = cfg.alignment_lag if cfg.alignment_lag is not None else resolve_alignment_lag(align_cfg, align_stats)
+    align_meta = alignment_metadata(align_cfg, align_stats, align_lag)
+
     return EpisodeResult(
         episode_index=episode_index,
         num_frames=num_frames,
@@ -184,8 +223,10 @@ def process_episode(episode_index: int, pipe_cfg: PipelineConfig | None = None) 
             "stage1_exclude_frames": int(stage1_exclude.sum()),
             "stage1_post_zero_grace_frames": cfg.stage1_post_zero_grace_frames,
             "embodiment": schema.embodiment,
-            "canonical_dim": schema.canonical_dim,
+            "state_dim": schema.pipeline_state_dim,
+            "action_dim": schema.pipeline_action_dim,
             **s5_meta,
+            **align_meta,
         },
     )
 
@@ -199,8 +240,20 @@ def _write_output_episode(cfg: PipelineConfig, result: EpisodeResult) -> None:
     chunk = result.episode_index // 1000
     dst = cfg.output_dir / "data_filtered" / f"chunk-{chunk:03d}" / f"episode_{result.episode_index:06d}.parquet"
     table = read_episode_table(src)
-    if cfg.action_from_state:
-        table = replace_action_with_state_table(table, schema=cfg.schema)
+
+    align_cfg = cfg.state_action_alignment or StateActionAlignConfig()
+    align_lag = cfg.alignment_lag if cfg.alignment_lag is not None else resolve_alignment_lag(
+        align_cfg, _WORKER_STATE.get("align_stats")
+    )
+    if align_cfg.enabled and align_lag > 0 and cfg.schema.embodiment in ("humanoid", "robomind_ur"):
+        state, action = extract_state_action_from_table(table, cfg.schema)
+        if cfg.schema.embodiment == "robomind_ur":
+            aligned_action = apply_robomind_temporal_alignment(state, action, align_lag)
+        else:
+            num_dims = matched_alignment_dims(cfg.schema, state, action)
+            aligned_action = apply_state_action_temporal_alignment(state, action, align_lag, num_dims)
+        table = update_table_action_columns(table, aligned_action, cfg.schema)
+
     write_episode_with_validity_mask(dst, table, result.step_validity_mask)
 
     s5_cfg = cfg.stage5 or Stage5Config()
@@ -242,7 +295,6 @@ def run_pipeline(
         num_workers=cfg.num_workers,
         num_bins=cfg.stats_num_bins,
         show_progress=show_progress,
-        action_from_state=cfg.action_from_state,
     )
 
     s1_cache = cfg.stage1_stats_cache_path or (cfg.output_dir / "cache" / "stage1_global_stats.npz")
@@ -257,15 +309,30 @@ def run_pipeline(
         num_workers=cfg.num_workers,
         num_bins=cfg.stats_num_bins,
         show_progress=show_progress,
-        action_from_state=cfg.action_from_state,
     )
+
+    align_cfg = cfg.state_action_alignment or StateActionAlignConfig()
+    align_cache = cfg.state_action_lag_cache_path or (
+        cfg.output_dir / "cache" / "state_action_lag.npz"
+    )
+    align_stats = load_or_compute_action_state_lag(
+        cfg.dataset_root,
+        align_cache,
+        stats_eps,
+        cfg.schema,
+        align_cfg,
+        recompute=cfg.state_action_lag_recompute,
+        num_workers=cfg.num_workers,
+        show_progress=show_progress,
+    )
+    cfg.alignment_lag = resolve_alignment_lag(align_cfg, align_stats)
 
     ctx = mp.get_context("fork")
     results: list[EpisodeResult] = []
     with ctx.Pool(
         processes=cfg.num_workers,
         initializer=_init_worker,
-        initargs=(global_stats, stage1_global_stats, cfg),
+        initargs=(global_stats, stage1_global_stats, cfg, align_stats),
     ) as pool:
         iterator = pool.imap_unordered(_worker_fn, episode_indices, chunksize=4)
         if show_progress:
@@ -286,16 +353,19 @@ def run_pipeline(
                 "num_episodes": global_stats.num_episodes,
                 "cache_path": str(cache_path),
                 "stage1_stats_cache_path": str(s1_cache),
+                "state_action_lag_cache_path": str(align_cache),
                 "stage1_threshold_mode": "global",
                 "embodiment": cfg.schema.embodiment,
-                "canonical_dim": cfg.schema.canonical_dim,
+                "state_dim": cfg.schema.pipeline_state_dim,
+                "action_dim": cfg.schema.pipeline_action_dim,
             },
             config_summary={
                 "output_mode": cfg.output_mode,
                 "num_workers": cfg.num_workers,
                 "processed_episodes": len(episode_indices),
                 "validity_mask_mode": "prefix_truncate_then_static_shorten",
-                "action_from_state": cfg.action_from_state,
+                "state_action_alignment_enabled": align_cfg.enabled,
+                "state_action_alignment_lag": resolve_alignment_lag(align_cfg, align_stats),
                 "stage4_max_static_steps": (cfg.stage4 or Stage4Config()).max_static_steps,
                 "stage5_enabled": (cfg.stage5 or Stage5Config()).enabled,
                 "embodiment": cfg.schema.embodiment,
@@ -323,12 +393,16 @@ def pipeline_config_from_yaml(yaml_cfg: dict, overrides: dict | None = None) -> 
     pipe = yaml_cfg.get("pipeline", {})
     s4 = yaml_cfg.get("stage4", {})
     s5 = yaml_cfg.get("stage5", {})
-    preprocess = yaml_cfg.get("preprocess", {})
+    sa = yaml_cfg.get("state_action_alignment", {})
 
     gripper_state = tuple(s3["exempt_dims"].get("gripper_state", list(schema.gripper_indices)))
     gripper_action = tuple(s3["exempt_dims"].get("gripper_action", list(schema.gripper_indices)))
     rpy_state = tuple(s3["exempt_dims"].get("rpy_state", list(schema.rpy_indices)))
     rpy_action = tuple(s3["exempt_dims"].get("rpy_action", list(schema.rpy_indices)))
+
+    fixed_lag = sa.get("fixed_lag")
+    if fixed_lag is not None:
+        fixed_lag = int(fixed_lag)
 
     return PipelineConfig(
         dataset_root=dataset_root,
@@ -342,7 +416,23 @@ def pipeline_config_from_yaml(yaml_cfg: dict, overrides: dict | None = None) -> 
             overrides.get("stage1_post_zero_grace_frames", pipe.get("stage1_post_zero_grace_frames", 0))
         ),
         discard_short_prefix=bool(overrides.get("discard_short_prefix", pipe.get("discard_short_prefix", False))),
-        action_from_state=bool(overrides.get("action_from_state", preprocess.get("action_from_state", False))),
+        state_action_alignment=StateActionAlignConfig(
+            enabled=bool(overrides.get("state_action_alignment_enabled", sa.get("enabled", False))),
+            max_lag_frames=int(sa.get("max_lag_frames", 5)),
+            diff_epsilon=float(sa.get("diff_epsilon", 1e-4)),
+            min_active_samples=int(sa.get("min_active_samples", 10)),
+            fixed_lag=fixed_lag,
+            default_lag=int(sa.get("default_lag", 1)),
+        ),
+        state_action_lag_recompute=bool(
+            overrides.get("state_action_lag_recompute", sa.get("stats", {}).get("recompute", True))
+        ),
+        state_action_lag_cache_path=Path(
+            overrides.get(
+                "state_action_lag_cache_path",
+                output_dir / sa.get("stats", {}).get("cache_path", "cache/state_action_lag.npz"),
+            )
+        ),
         stage1=Stage1Config(
             median_kernel=s1["smoothing"]["median_kernel"],
             savgol_window=s1["smoothing"]["savgol_window"],
@@ -368,7 +458,7 @@ def pipeline_config_from_yaml(yaml_cfg: dict, overrides: dict | None = None) -> 
             savgol_window=s2["smoothing"]["savgol_window"],
             savgol_polyorder=s2["smoothing"]["savgol_polyorder"],
             max_lag_frames=s2["alignment"]["max_lag_frames"],
-            diff_epsilon=s2["alignment"]["diff_epsilon"],
+            diff_epsilon=float(overrides.get("stage2_diff_epsilon", s2["alignment"]["diff_epsilon"])),
             min_active_samples=s2["alignment"]["min_active_samples"],
             da_per_dim=s2["thresholds"]["da_per_dim"],
             da_episode_mean=s2["thresholds"]["da_episode_mean"],
